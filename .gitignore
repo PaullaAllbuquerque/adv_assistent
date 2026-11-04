@@ -1,0 +1,17 @@
+# Ambientes virtuais
+venv/
+env/
+__pycache__/
+
+# Variáveis de ambiente e segredos (Segurança)
+.env
+
+# Logs do sistema
+logs/
+
+# Planilhas locais de dados
+data/
+*.xlsx
+
+# Sistema operacional
+.DS_Store

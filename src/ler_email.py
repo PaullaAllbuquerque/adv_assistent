@@ -1,0 +1,244 @@
+import os
+import time
+import json
+import imaplib
+import email
+import logging
+from email.header import decode_header
+from pathlib import Path
+from typing import List, Optional
+from dotenv import load_dotenv
+from google import genai
+from google.genai.errors import APIError
+import pandas as pd
+from pydantic import BaseModel, Field
+
+# Carrega o .env da raiz do projeto
+caminho_raiz = Path(__file__).resolve().parent.parent / '.env'
+load_dotenv(dotenv_path=caminho_raiz)
+
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Diretórios do projeto
+DIRETORIO_RAIZ = Path(__file__).resolve().parent.parent
+DIRETORIO_DADOS = DIRETORIO_RAIZ / 'data'
+DIRETORIO_DADOS.mkdir(exist_ok=True)
+CAMINHO_PLANILHA = DIRETORIO_DADOS / "Acompanhamento_Demandas.xlsx"
+
+DIRETORIO_LOGS = DIRETORIO_RAIZ / 'logs'
+DIRETORIO_LOGS.mkdir(exist_ok=True)
+CAMINHO_LOG = DIRETORIO_LOGS / 'sistema.log'
+
+# Configuração do Sistema de Logs (Caixa-Preta / Auditoria)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(CAMINHO_LOG, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+
+# Inicializa o cliente do Gemini
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# ==========================================
+# MODELO PYDANTIC (Validação de Dados)
+# ==========================================
+class AudienciaVinicius(BaseModel):
+    id: Optional[int] = Field(default=None, description="ID sequencial numérico")
+    data_inicial: str = Field(alias="Data Inicial", description="Data da audiência no formato DD/MM/AAAA")
+    hora_inicial: str = Field(alias="Hora Inicial", description="Horário da audiência HH:MM")
+    compromisso: str = Field(alias="Compromisso", description="Tipo de audiência")
+    local: str = Field(alias="Local", description="Localidade ou cidade")
+    distribuicao_atual: str = Field(alias="Distribuição Atual", description="Vara do Trabalho")
+    cliente: str = Field(alias="Cliente", description="Nome do cliente/empresa")
+    processo_partes: str = Field(alias="Processo / Partes", description="Partes e número unificado do processo")
+    numero_pasta: str = Field(alias="Número da Pasta", description="Número da pasta")
+    encarregado: str = Field(alias="Encarregado", description="Sempre VINICIUS")
+    materia: str = Field(alias="Matéria", description="Matéria do processo")
+    anotacoes_links: str = Field(alias="Anotações / Links", description="Links de Zoom, IDs, senhas e despachos")
+
+class ListaAudiencias(BaseModel):
+    audiencias: List[AudienciaVinicius]
+
+
+def extrair_corpo_email(msg):
+    """Extrai o texto e/ou HTML do corpo do e-mail."""
+    corpo = ""
+    if msg.is_multipart():
+        for parte in msg.walk():
+            content_type = parte.get_content_type()
+            content_disposition = str(parte.get("Content-Disposition", ""))
+            if content_type in ["text/plain", "text/html"] and "attachment" not in content_disposition:
+                payload = parte.get_payload(decode=True)
+                if payload:
+                    corpo += payload.decode(errors="ignore") + "\n"
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            corpo = payload.decode(errors="ignore")
+    return corpo
+
+
+def extrair_audiencias_vinicius_com_gemini(corpo_email):
+    logging.info("Enviando o corpo do e-mail para o Gemini extrair as audiências do VINICIUS (com Pydantic)...")
+    
+    prompt = f"""
+    Você é um Assistente Jurídico Inteligente especializado em pautas trabalhistas.
+    Abaixo está o conteúdo de um e-mail contendo uma pauta semanal de audiências.
+
+    SUA TAREFA PRINCIPAL:
+    1. Identifique todas as linhas da tabela de audiências.
+    2. Filtre e retorne APENAS as audiências em que o Encarregado é "VINICIUS" (ou "VINÍCIUS"). Ignore audiências de outros advogados.
+    3. Retorne o resultado ESTRITAMENTE em formato JSON contendo uma chave "audiencias" que seja uma lista de objetos com os campos exatos solicitados.
+
+    Campos obrigatórios por objeto:
+    - "Data Inicial"
+    - "Hora Inicial"
+    - "Compromisso"
+    - "Local"
+    - "Distribuição Atual"
+    - "Cliente"
+    - "Processo / Partes"
+    - "Número da Pasta"
+    - "Encarregado" (deve ser "VINICIUS")
+    - "Matéria"
+    - "Anotações / Links"
+
+    Conteúdo do E-mail:
+    {corpo_email}
+    """
+
+    tentativas = 3
+    for tentativa in range(tentativas):
+        try:
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt,
+                config={
+                    "response_mime_type": "application/json"
+                }
+            )
+            
+            dados_brutos = json.loads(response.text)
+            if isinstance(dados_brutos, list):
+                dados_brutos = {"audiencias": dados_brutos}
+                
+            validado = ListaAudiencias(**dados_brutos)
+            logging.info(f"Sucesso na extração e validação via Pydantic. Total de {len(validado.audiencias)} audiência(s) do Vinícius.")
+            return [item.model_dump(by_alias=True) for item in validado.audiencias]
+
+        except APIError as e:
+            if e.code == 503 and tentativa < tentativas - 1:
+                logging.warning(f"Servidor do Gemini instável (503). Tentando novamente em 5 segundos... (Tentativa {tentativa + 1}/{tentativas})")
+                time.sleep(5)
+            else:
+                logging.error(f"Erro crítico na API do Gemini: {e}")
+                raise e
+        except Exception as e:
+            logging.error(f"Erro na validação do Pydantic ou JSON: {e}")
+            if tentativa == tentativas - 1:
+                return []
+            time.sleep(2)
+
+
+def atualizar_ou_criar_planilha(novas_audiencias):
+    if not novas_audiencias:
+        logging.info("Nenhuma audiência do Vinícius validada para adicionar à planilha.")
+        return
+
+    logging.info("Atualizando a planilha de acompanhamento personalizada do Vinícius...")
+    df_novos = pd.DataFrame(novas_audiencias)
+    
+    colunas_ordenadas = [
+        "ID", "Data Inicial", "Hora Inicial", "Compromisso", "Local", 
+        "Distribuição Atual", "Cliente", "Processo / Partes", 
+        "Número da Pasta", "Encarregado", "Matéria", "Anotações / Links"
+    ]
+
+    if CAMINHO_PLANILHA.exists():
+        df_antigo = pd.read_excel(CAMINHO_PLANILHA)
+        
+        if "ID" not in df_antigo.columns:
+            df_antigo["ID"] = range(1, len(df_antigo) + 1)
+
+        # BLINDAGEM DE DUPLICADAS POR CHAVE ÚNICA:
+        # Consideramos que uma audiência é duplicada se tiver a mesma Data, Hora e Número do Processo/Partes
+        colunas_chave = ["Data Inicial", "Hora Inicial", "Processo / Partes"]
+        
+        # Junta os dados antigos e novos
+        df_concat = pd.concat([df_antigo, df_novos], ignore_index=True)
+        
+        # Remove duplicatas baseando-se estritamente nas colunas-chave, mantendo a última atualização
+        df_limpo = df_concat.drop_duplicates(subset=colunas_chave, keep='last').copy()
+
+        # Reatribui IDs numéricos limpos e sequenciais
+        df_limpo["ID"] = range(1, len(df_limpo) + 1)
+        df_final = df_limpo
+    else:
+        df_novos["ID"] = range(1, len(df_novos) + 1)
+        df_final = df_novos
+
+    colunas_presentes = [c for c in colunas_ordenadas if c in df_final.columns]
+    df_final = df_final[colunas_presentes]
+
+    df_final.to_excel(CAMINHO_PLANILHA, index=False)
+    logging.info(f"Planilha do Vinícius limpa e salva com sucesso em: {CAMINHO_PLANILHA}")
+
+
+def conectar_e_ler_emails():
+    if not EMAIL_USER or not EMAIL_PASS:
+        logging.critical("Erro crítico: Credenciais de e-mail não encontradas no .env!")
+        return
+
+    try:
+        logging.info("Conectando ao servidor IMAP do Gmail...")
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(EMAIL_USER, EMAIL_PASS)
+        mail.select("inbox")
+        
+        remetente_alvo = "paulamlleal@gmail.com"
+        logging.info(f"Filtrando e-mails do remetente: {remetente_alvo}")
+        
+        status, messages = mail.search(None, f'(FROM "{remetente_alvo}")')
+        if status != "OK" or not messages[0]:
+            logging.warning("Nenhum e-mail encontrado para este remetente.")
+            return
+
+        email_ids = messages[0].split()
+        ultimos_ids = email_ids[-1:] 
+        
+        logging.info("Processando o ÚLTIMO e-mail recebido com chave de unicidade...")
+        
+        for e_id in ultimos_ids:
+            res, msg_data = mail.fetch(e_id, "(RFC822)")
+            for response_part in msg_data:
+                if isinstance(response_part, tuple):
+                    msg = email.message_from_bytes(response_part[1])
+                    
+                    assunto, encoding = decode_header(msg["Subject"])[0]
+                    if isinstance(assunto, bytes):
+                        assunto = assunto.decode(encoding if encoding else "utf-8", errors="ignore")
+                    
+                    remetente = msg["From"]
+                    logging.info(f"E-mail Lido -> De: {remetente} | Assunto: {assunto}")
+                    
+                    corpo_email = extrair_corpo_email(msg)
+                    
+                    if corpo_email.strip():
+                        audiencias_vinicius = extrair_audiencias_vinicius_com_gemini(corpo_email)
+                        atualizar_ou_criar_planilha(audiencias_vinicius)
+                    else:
+                        logging.warning("Aviso: O corpo do e-mail veio vazio.")
+                    
+        mail.logout()
+        logging.info("Conexão IMAP encerrada com sucesso.")
+
+    except Exception as e:
+        logging.error(f"Erro crítico ao processar o fluxo: {e}")
+
+if __name__ == "__main__":
+    conectar_e_ler_emails()
