@@ -12,6 +12,10 @@ from google import genai
 from google.genai.errors import APIError
 import pandas as pd
 from pydantic import BaseModel, Field
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from google_drive import upload_planilha_drive
+
 
 # Carrega o .env da raiz do projeto
 caminho_raiz = Path(__file__).resolve().parent.parent / '.env'
@@ -145,6 +149,60 @@ def extrair_audiencias_vinicius_com_gemini(corpo_email):
             time.sleep(2)
 
 
+def aplicar_layout_branding_vinicius(caminho_arquivo):
+    """Aplica o layout executivo de forma segura na planilha Excel."""
+    wb = openpyxl.load_workbook(caminho_arquivo)
+    ws = wb.active
+
+    # Usamos uma fonte em negrito limpa para o cabeçalho
+    fonte_cabecalho = Font(name="Calibri", size=11, bold=True)
+    
+    borda_fina = Border(
+        left=Side(style='thin', color='D9D9D9'),
+        right=Side(style='thin', color='D9D9D9'),
+        top=Side(style='thin', color='D9D9D9'),
+        bottom=Side(style='thin', color='D9D9D9')
+    )
+    
+    fonte_celulas = Font(name="Calibri", size=10)
+    alinhamento_central = Alignment(horizontal="center", vertical="center")
+    alinhamento_esquerda = Alignment(horizontal="left", vertical="center")
+
+    # Formata o cabeçalho real da tabela na linha 1
+    linha_cabecalho = 1
+    for col in range(1, ws.max_column + 1):
+        cell = ws.cell(row=linha_cabecalho, column=col)
+        cell.font = fonte_cabecalho
+        cell.alignment = alinhamento_central
+
+    # Formata as linhas de dados (a partir da linha 2)
+    for row in range(linha_cabecalho + 1, ws.max_row + 1):
+        for col in range(1, ws.max_column + 1):
+            cell = ws.cell(row=row, column=col)
+            cell.font = fonte_celulas
+            cell.border = borda_fina
+            
+            if col in [1, 2, 3, 10]:
+                cell.alignment = alinhamento_central
+            else:
+                cell.alignment = alinhamento_esquerda
+
+    # Ajusta largura das colunas automaticamente
+    for col in ws.columns:
+        max_len = 0
+        col_letter = openpyxl.utils.get_column_letter(col[0].column)
+        for cell in col:
+            if cell.value:
+                max_len = max(max_len, len(str(cell.value)))
+        ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+
+    wb.save(caminho_arquivo)
+    logging.info("Layout executivo aplicado com sucesso à planilha Excel.")
+# Sincroniza automaticamente com o Google Drive do escritório
+
+    logging.info("A iniciar o upload da planilha para o Google Drive...")
+    upload_planilha_drive()
+
 def atualizar_ou_criar_planilha(novas_audiencias):
     if not novas_audiencias:
         logging.info("Nenhuma audiência do Vinícius validada para adicionar à planilha.")
@@ -165,17 +223,11 @@ def atualizar_ou_criar_planilha(novas_audiencias):
         if "ID" not in df_antigo.columns:
             df_antigo["ID"] = range(1, len(df_antigo) + 1)
 
-        # BLINDAGEM DE DUPLICADAS POR CHAVE ÚNICA:
-        # Consideramos que uma audiência é duplicada se tiver a mesma Data, Hora e Número do Processo/Partes
         colunas_chave = ["Data Inicial", "Hora Inicial", "Processo / Partes"]
         
-        # Junta os dados antigos e novos
         df_concat = pd.concat([df_antigo, df_novos], ignore_index=True)
-        
-        # Remove duplicatas baseando-se estritamente nas colunas-chave, mantendo a última atualização
         df_limpo = df_concat.drop_duplicates(subset=colunas_chave, keep='last').copy()
 
-        # Reatribui IDs numéricos limpos e sequenciais
         df_limpo["ID"] = range(1, len(df_limpo) + 1)
         df_final = df_limpo
     else:
@@ -186,7 +238,9 @@ def atualizar_ou_criar_planilha(novas_audiencias):
     df_final = df_final[colunas_presentes]
 
     df_final.to_excel(CAMINHO_PLANILHA, index=False)
-    logging.info(f"Planilha do Vinícius limpa e salva com sucesso em: {CAMINHO_PLANILHA}")
+    aplicar_layout_branding_vinicius(CAMINHO_PLANILHA)
+    
+    logging.info(f"Planilha de Vinícius Bismarque formatada e salva com sucesso em: {CAMINHO_PLANILHA}")
 
 
 def conectar_e_ler_emails():
@@ -211,7 +265,7 @@ def conectar_e_ler_emails():
         email_ids = messages[0].split()
         ultimos_ids = email_ids[-1:] 
         
-        logging.info("Processando o ÚLTIMO e-mail recebido com chave de unicidade...")
+        logging.info("Processando o ÚLTIMO e-mail recebido com branding oficial...")
         
         for e_id in ultimos_ids:
             res, msg_data = mail.fetch(e_id, "(RFC822)")

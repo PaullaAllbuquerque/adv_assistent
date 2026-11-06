@@ -14,4 +14,5 @@ data/
 *.xlsx
 
 # Sistema operacional
-.DS_Store
+.DS_Storecredentials.json
+token.json
